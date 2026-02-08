@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Producer-side resources for cross-account S3 data transfer (Consumer Pull model).
+  Creates a KMS-encrypted S3 bucket and a read-only IAM role that the consumer
+  account assumes to pull data.
+
+Parameters:
+  ConsumerAccountId:
+    Type: String
+    Description: The 12-digit AWS account ID of the consumer account.
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID.
+
+  OrganisationId:
+    Type: String
+    Description: The AWS Organizations ID used to restrict access.
+    AllowedPattern: '^o-[a-z0-9]+$'
+    ConstraintDescription: Must be a valid AWS Organizations ID (e.g. o-abc123def4).
+
+  ExternalId:
+    Type: String
+    Description: External ID for the cross-account assume-role trust policy.
+    MinLength: 16
+    NoEcho: true
+
+  AdminRoleName:
+    Type: String
+    Description: Name of the IAM admin role permitted to manage the KMS key.
+    Default: Admin
+
+  BucketNameSuffix:
+    Type: String
+    Description: Suffix appended to the account ID when naming the S3 bucket.
+    Default: producer-data
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # KMS Key for S3 server-side encryption
+  # ---------------------------------------------------------------------------
+  ProducerKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting objects in the producer S3 bucket.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: producer-kms-key-policy
+        Statement:
+          - Sid: AllowRootFullAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+          - Sid: AllowAdminRoleKeyManagement
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${AdminRoleName}"
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: "*"
+
+          - Sid: AllowCrossAccountDecryptOnly
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CrossAccountReadRole.Arn
+            Action:
+              - kms:Decrypt
+            Resource: "*"
+
+  ProducerKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/s3-hydration-producer
+      TargetKeyId: !Ref ProducerKmsKey
+
+  # ---------------------------------------------------------------------------
+  # Access Log Bucket (must be created before the producer bucket)
+  # ---------------------------------------------------------------------------
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${BucketNameSuffix}-access-logs"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogsAfter365Days
+            Status: Enabled
+            ExpirationInDays: 365
+
+  # ---------------------------------------------------------------------------
+  # Producer S3 Bucket
+  # ---------------------------------------------------------------------------
+  ProducerBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: AccessLogBucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ProducerKmsKey.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: "producer-access-logs/"
+
+  # ---------------------------------------------------------------------------
+  # Producer Bucket Policy
+  # ---------------------------------------------------------------------------
+  ProducerBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProducerBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonHttps
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ProducerBucket.Arn
+              - !Sub "${ProducerBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+          - Sid: DenyOutsideOrg
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ProducerBucket.Arn
+              - !Sub "${ProducerBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalOrgID: !Ref OrganisationId
+
+          - Sid: AllowCrossAccountRead
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CrossAccountReadRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt ProducerBucket.Arn
+              - !Sub "${ProducerBucket.Arn}/*"
+
+  # ---------------------------------------------------------------------------
+  # Cross-Account Read Role (assumed by the consumer account)
+  # ---------------------------------------------------------------------------
+  CrossAccountReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: S3HydrationCrossAccountReadRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${ConsumerAccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganisationId
+                sts:ExternalId: !Ref ExternalId
+  # ---------------------------------------------------------------------------
+  # Separate policy to break circular dependency between KMS key and role
+  # ---------------------------------------------------------------------------
+  CrossAccountReadPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: S3HydrationCrossAccountReadPolicy
+      Roles:
+        - !Ref CrossAccountReadRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3Read
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${AWS::AccountId}-${BucketNameSuffix}/*"
+          - Sid: AllowS3List
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Sub "arn:aws:s3:::${AWS::AccountId}-${BucketNameSuffix}"
+          - Sid: AllowKmsDecrypt
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource: !GetAtt ProducerKmsKey.Arn
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  BucketArn:
+    Description: ARN of the producer S3 bucket.
+    Value: !GetAtt ProducerBucket.Arn
+
+  BucketName:
+    Description: Name of the producer S3 bucket.
+    Value: !Ref ProducerBucket
+
+  RoleArn:
+    Description: ARN of the cross-account read role for the consumer to assume.
+    Value: !GetAtt CrossAccountReadRole.Arn
+
+  KmsKeyArn:
+    Description: ARN of the KMS key used for bucket encryption.
+    Value: !GetAtt ProducerKmsKey.Arn
+
+  KmsKeyId:
+    Description: ID of the KMS key used for bucket encryption.
+    Value: !Ref ProducerKmsKey

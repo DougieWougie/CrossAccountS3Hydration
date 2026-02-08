@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Consumer-side infrastructure for cross-account S3 data transfer (Consumer Pull model).
+  A Lambda function assumes a read-only role in the producer account, streams objects from
+  the producer bucket, and re-encrypts them with the consumer's own KMS key before writing
+  to the consumer bucket.
+
+Parameters:
+  ProducerAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: The 12-digit AWS account ID of the producer account.
+
+  ProducerBucketName:
+    Type: String
+    Description: Name of the S3 bucket in the producer account.
+
+  ProducerBucketArn:
+    Type: String
+    Description: ARN of the S3 bucket in the producer account.
+
+  CrossAccountRoleArn:
+    Type: String
+    Description: ARN of the IAM role in the producer account that the Lambda function will assume.
+
+  ProducerKmsKeyArn:
+    Type: String
+    Description: ARN of the KMS key used to encrypt objects in the producer bucket.
+
+  OrganisationId:
+    Type: String
+    AllowedPattern: '^o-[a-z0-9]+$'
+    Description: AWS Organizations ID used to restrict bucket access.
+
+  ExternalId:
+    Type: String
+    MinLength: 16
+    Description: External ID used when assuming the cross-account role.
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 6 * * ? *)"
+    Description: EventBridge schedule expression for triggering the transfer Lambda.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC in which the Lambda function will run.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets in which the Lambda function will run.
+
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Description: Route table IDs to associate with the S3 VPC gateway endpoint.
+
+  AdminRoleName:
+    Type: String
+    Default: Admin
+    Description: Name of the IAM role granted administrative access to the KMS key.
+
+  BucketNameSuffix:
+    Type: String
+    Default: consumer-data
+    Description: Suffix appended to the account ID to form the consumer bucket name.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Email address for CloudWatch alarm notifications. Leave empty to disable.
+
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment zip.
+
+  LambdaS3Key:
+    Type: String
+    Description: S3 key for the Lambda deployment zip.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # KMS Key -- consumer-only, no cross-account access
+  # ---------------------------------------------------------------------------
+  ConsumerKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting objects in the consumer S3 bucket.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowAdminRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/${AdminRoleName}"
+            Action: "kms:*"
+            Resource: "*"
+
+  ConsumerKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/s3-hydration-consumer
+      TargetKeyId: !Ref ConsumerKmsKey
+
+  # ---------------------------------------------------------------------------
+  # Access Log Bucket
+  # ---------------------------------------------------------------------------
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${BucketNameSuffix}-access-logs"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  # ---------------------------------------------------------------------------
+  # Consumer S3 Bucket
+  # ---------------------------------------------------------------------------
+  ConsumerBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ConsumerKmsKey.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: "consumer-access-logs/"
+
+  ConsumerBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConsumerBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonHttps
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ConsumerBucket.Arn
+              - !Sub "${ConsumerBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: DenyOutsideOrg
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ConsumerBucket.Arn
+              - !Sub "${ConsumerBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalOrgID: !Ref OrganisationId
+
+  # ---------------------------------------------------------------------------
+  # SQS Dead Letter Queue
+  # ---------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: s3-hydration-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # ---------------------------------------------------------------------------
+  TransferLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/s3-hydration-transfer
+      RetentionInDays: 90
+
+  # ---------------------------------------------------------------------------
+  # Lambda Security Group
+  # ---------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for s3-hydration transfer Lambda function.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS egress for S3 gateway and STS endpoint.
+
+  # ---------------------------------------------------------------------------
+  # VPC S3 Gateway Endpoint
+  # ---------------------------------------------------------------------------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref VpcId
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowProducerBucketRead
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Ref ProducerBucketArn
+              - !Sub "${ProducerBucketArn}/*"
+          - Sid: AllowConsumerBucketWrite
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource:
+              - !GetAtt ConsumerBucket.Arn
+              - !Sub "${ConsumerBucket.Arn}/*"
+
+  # ---------------------------------------------------------------------------
+  # Lambda Execution Role
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3HydrationLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AssumeProducerRole
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: !Ref CrossAccountRoleArn
+              - Sid: WriteConsumerBucket
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${ConsumerBucket.Arn}/*"
+              - Sid: ReadConsumerBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ConsumerBucket.Arn
+                  - !Sub "${ConsumerBucket.Arn}/*"
+              - Sid: ConsumerKmsAccess
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt ConsumerKmsKey.Arn
+              - Sid: ProducerKmsDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !Ref ProducerKmsKeyArn
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt TransferLogGroup.Arn
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              - Sid: DlqSendMessage
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Sid: VpcNetworkInterfaces
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # Lambda Function
+  # ---------------------------------------------------------------------------
+  TransferFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TransferLogGroup
+    Properties:
+      FunctionName: s3-hydration-transfer
+      Runtime: python3.12
+      Handler: src.handler.lambda_handler
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Timeout: 900
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt LambdaExecutionRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          PRODUCER_BUCKET: !Ref ProducerBucketName
+          CONSUMER_BUCKET: !Ref ConsumerBucket
+          CROSS_ACCOUNT_ROLE_ARN: !Ref CrossAccountRoleArn
+          EXTERNAL_ID: !Ref ExternalId
+          CONSUMER_KMS_KEY_ID: !Ref ConsumerKmsKey
+          PRODUCER_KMS_KEY_ARN: !Ref ProducerKmsKeyArn
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Schedule
+  # ---------------------------------------------------------------------------
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Scheduled trigger for S3 hydration transfer Lambda.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TransferFunction.Arn
+          Id: S3HydrationTarget
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransferFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  # ---------------------------------------------------------------------------
+  # SNS Alarm Topic
+  # ---------------------------------------------------------------------------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      TopicName: s3-hydration-alarms
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # ---------------------------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-hydration-lambda-errors
+      AlarmDescription: Alarm when the S3 hydration transfer Lambda encounters errors.
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransferFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], []]
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-hydration-lambda-duration
+      AlarmDescription: Alarm when the S3 hydration transfer Lambda approaches timeout.
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransferFunction
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 780000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], []]
+
+  DlqDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-hydration-dlq-depth
+      AlarmDescription: Alarm when messages appear in the dead letter queue.
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], []]
+
+  ObjectsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: s3-hydration-objects-failed
+      AlarmDescription: Alarm when individual object transfers fail.
+      MetricName: ObjectsFailed
+      Namespace: S3Hydration
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], []]
+
+Outputs:
+  ConsumerBucketArn:
+    Description: ARN of the consumer S3 bucket.
+    Value: !GetAtt ConsumerBucket.Arn
+
+  ConsumerBucketName:
+    Description: Name of the consumer S3 bucket.
+    Value: !Ref ConsumerBucket
+
+  ConsumerKmsKeyArn:
+    Description: ARN of the consumer KMS key.
+    Value: !GetAtt ConsumerKmsKey.Arn
+
+  LambdaFunctionArn:
+    Description: ARN of the transfer Lambda function.
+    Value: !GetAtt TransferFunction.Arn
+
+  DeadLetterQueueUrl:
+    Description: URL of the dead letter queue.
+    Value: !Ref DeadLetterQueue
