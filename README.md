@@ -6,16 +6,6 @@ Designed to be deployed as **AWS Service Catalog products** so that teams can se
 
 ## Architecture
 
-```
-Producer Account                          Consumer Account
-┌──────────────────────┐                  ┌──────────────────────────────────┐
-│  S3 Bucket (KMS)     │◄─── GetObject ───│  Lambda (VPC)                    │
-│  CrossAccount Role   │    AssumeRole    │  ├── EventBridge (daily cron)    │
-│                      │                  │  ├── S3 Bucket (consumer KMS)    │
-│                      │                  │  ├── DLQ (SQS)                   │
-│                      │                  │  └── CloudWatch Alarms           │
-└──────────────────────┘                  └──────────────────────────────────┘
-```
 <img width="1401" height="1361" alt="image" src="https://github.com/user-attachments/assets/d99f93cf-0a8b-48b4-ade7-ee9b5a31a607" />
 
 
